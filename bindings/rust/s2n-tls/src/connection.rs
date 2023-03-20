@@ -80,12 +80,12 @@ impl Connection {
         }
 
         let mut connection = Self { connection };
-        connection.init_context();
+        connection.init_context(mode);
         connection
     }
 
-    fn init_context(&mut self) {
-        let context = Box::<Context>::default();
+    fn init_context(&mut self, mode: Mode) {
+        let context = Box::new(Context::new(mode));
         let context = Box::into_raw(context) as *mut c_void;
         // allocate a new context object
         unsafe {
@@ -108,11 +108,19 @@ impl Connection {
         Self::new(Mode::Server)
     }
 
+    pub(crate) fn as_ptr(&mut self) -> *mut s2n_connection {
+        self.connection.as_ptr()
+    }
+
     /// # Safety
     ///
     /// Caller must ensure s2n_connection is a valid reference to a [`s2n_connection`] object
     pub(crate) unsafe fn from_raw(connection: NonNull<s2n_connection>) -> Self {
         Self { connection }
+    }
+
+    pub(crate) fn mode(&self) -> Mode {
+        self.context().mode
     }
 
     /// can be used to configure s2n to either use built-in blinding (set blinding
@@ -349,6 +357,7 @@ impl Connection {
     /// called. Reusing the same connection handle(s) is more performant than repeatedly
     /// calling s2n_connection_new and s2n_connection_free
     pub fn wipe(&mut self) -> Result<&mut Self, Error> {
+        let mode = self.mode();
         unsafe {
             // Wiping the connection will wipe the pointer to the context,
             // so retrieve and drop that memory first.
@@ -358,17 +367,16 @@ impl Connection {
             s2n_connection_wipe(self.connection.as_ptr()).into_result()
         }?;
 
-        self.init_context();
+        self.init_context(mode);
         Ok(self)
     }
 
     /// Performs the TLS handshake to completion
     ///
     /// Multiple callbacks can be configured for a connection and config, but
-    /// [`poll_negotiate`] can only execute and block on one callback at a time.
+    /// [`Self::poll_negotiate()`] can only execute and block on one callback at a time.
     /// The handshake is sequential, not concurrent, and stops execution when
-    /// it encounters an async callback. The async task is stored on the
-    /// [`Context::connection_future`].
+    /// it encounters an async callback.
     ///
     /// The handshake does not continue execution (and therefore can't call
     /// any other callbacks) until the blocking async task reports completion.
@@ -399,7 +407,7 @@ impl Connection {
                 Poll::Pending => {
                     // if there is no connection_future then return, otherwise continue
                     // looping and polling the future
-                    if self.context_mut().connection_future.is_none() {
+                    if self.context_mut().async_callback.is_none() {
                         return Poll::Pending;
                     }
                 }
@@ -411,14 +419,14 @@ impl Connection {
     //
     // If the future returns Pending, then re-set it back on the Connection.
     fn poll_async_task(&mut self) -> Option<Poll<Result<(), Error>>> {
-        self.take_connection_future().map(|mut fut| {
+        self.take_async_callback().map(|mut callback| {
             let waker = self.waker().ok_or(Error::MISSING_WAKER)?.clone();
             let mut ctx = core::task::Context::from_waker(&waker);
-            match fut.poll(self, &mut ctx) {
+            match Pin::new(&mut callback).poll(self, &mut ctx) {
                 Poll::Ready(result) => Poll::Ready(result),
                 Poll::Pending => {
                     // replace the future if it hasn't completed yet
-                    self.set_connection_future(fut);
+                    self.set_async_callback(callback);
                     Poll::Pending
                 }
             }
@@ -559,17 +567,16 @@ impl Connection {
     ///
     /// If the Future returns `Poll::Pending` and has not completed, then it
     /// should be re-set using [`Self::set_connection_future()`]
-    fn take_connection_future(&mut self) -> Option<InternalConnectionFuture> {
+    fn take_async_callback(&mut self) -> Option<AsyncCallback> {
         let ctx = self.context_mut();
-        ctx.connection_future.take()
+        ctx.async_callback.take()
     }
 
     /// Sets a `connection_future` on the connection context.
-    pub(crate) fn set_connection_future(&mut self, f: InternalConnectionFuture) {
+    pub(crate) fn set_async_callback(&mut self, callback: AsyncCallback) {
         let ctx = self.context_mut();
-        debug_assert!(ctx.connection_future.is_none());
-
-        ctx.connection_future = Some(f);
+        debug_assert!(ctx.async_callback.is_none());
+        ctx.async_callback = Some(callback);
     }
 
     /// Retrieve a mutable reference to the [`Context`] stored on the connection.
@@ -659,40 +666,70 @@ impl Connection {
         // are static and immutable since they are const fields on static const structs
         static_const_str!(cipher)
     }
-}
 
-// Captures the type of ConnectionFuture and executes future specific
-// tasks.
-//
-// As an example, we need to call `mark_client_hello_cb_done` when the
-// client_hello callback returns [`Poll::Ready`] to make progress on
-// the handshake.
-pub(crate) enum InternalConnectionFuture {
-    ClientHello(Pin<Box<dyn ConnectionFuture>>),
-}
-
-impl InternalConnectionFuture {
-    fn poll(
-        &mut self,
-        conn: &mut Connection,
-        ctx: &mut core::task::Context,
-    ) -> Poll<Result<(), Error>> {
-        let InternalConnectionFuture::ClientHello(fut) = self;
-        match fut.as_mut().poll(conn, ctx) {
-            Poll::Ready(res) => {
-                // mark the client_hello callback finished
-                conn.mark_client_hello_cb_done()?;
-                Poll::Ready(res)
-            }
-            Poll::Pending => Poll::Pending,
+    pub fn selected_signature_algorithm(&self) -> Result<SignatureAlgorithm, Error> {
+        let mut sig_alg = s2n_tls_signature_algorithm::ANONYMOUS;
+        unsafe {
+            s2n_connection_get_selected_signature_algorithm(self.connection.as_ptr(), &mut sig_alg)
+                .into_result()?;
         }
+        sig_alg.try_into()
+    }
+
+    pub fn selected_hash_algorithm(&self) -> Result<HashAlgorithm, Error> {
+        let mut hash_alg = s2n_tls_hash_algorithm::NONE;
+        unsafe {
+            s2n_connection_get_selected_digest_algorithm(self.connection.as_ptr(), &mut hash_alg)
+                .into_result()?;
+        }
+        hash_alg.try_into()
+    }
+
+    pub fn selected_client_signature_algorithm(&self) -> Result<Option<SignatureAlgorithm>, Error> {
+        let mut sig_alg = s2n_tls_signature_algorithm::ANONYMOUS;
+        unsafe {
+            s2n_connection_get_selected_client_cert_signature_algorithm(
+                self.connection.as_ptr(),
+                &mut sig_alg,
+            )
+            .into_result()?;
+        }
+        Ok(match sig_alg {
+            s2n_tls_signature_algorithm::ANONYMOUS => None,
+            sig_alg => Some(sig_alg.try_into()?),
+        })
+    }
+
+    pub fn selected_client_hash_algorithm(&self) -> Result<Option<HashAlgorithm>, Error> {
+        let mut hash_alg = s2n_tls_hash_algorithm::NONE;
+        unsafe {
+            s2n_connection_get_selected_client_cert_digest_algorithm(
+                self.connection.as_ptr(),
+                &mut hash_alg,
+            )
+            .into_result()?;
+        }
+        Ok(match hash_alg {
+            s2n_tls_hash_algorithm::NONE => None,
+            hash_alg => Some(hash_alg.try_into()?),
+        })
     }
 }
 
-#[derive(Default)]
 struct Context {
+    mode: Mode,
     waker: Option<Waker>,
-    connection_future: Option<InternalConnectionFuture>,
+    async_callback: Option<AsyncCallback>,
+}
+
+impl Context {
+    fn new(mode: Mode) -> Self {
+        Context {
+            mode,
+            waker: None,
+            async_callback: None,
+        }
+    }
 }
 
 #[cfg(feature = "quic")]

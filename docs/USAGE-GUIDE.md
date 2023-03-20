@@ -335,7 +335,7 @@ Call `s2n_print_stacktrace()` to print your stacktrace.
 
 ## Initialization and Teardown
 
-The s2n-tls library must be initialized with `s2n_init()` before calling most library functions. `s2n_init()` MUST NOT be called more than once, even when an application uses multiple threads or processes. To clean up, `s2n_cleanup()` must be called from every thread or process created after `s2n_init()` was called.
+The s2n-tls library must be initialized with `s2n_init()` before calling most library functions. `s2n_init()` MUST NOT be called more than once, even when an application uses multiple threads or processes. s2n attempts to clean up its thread-local memory at thread-exit and all other memory at process-exit. However, this may not work if you are using a thread library other than pthreads. In that case you should call `s2n_cleanup()` from every thread or process created after `s2n_init()`.
 
 Initialization can be modified by calling `s2n_crypto_disable_init()` or `s2n_disable_atexit()` before `s2n_init()`.
 
@@ -523,6 +523,15 @@ Client authentication can be configured by calling `s2n_config_set_client_auth_t
 
 When using client authentication, the server MUST implement the `s2n_verify_host_fn`, because the default behavior will likely reject all client certificates.
 
+When using client authentication with TLS1.3, `s2n_negotiate` will report a successful
+handshake to clients before the server validates the client certificate. If the server then
+rejects the client certificate, the client may later receive an alert while calling `s2n_recv`,
+potentially after already having sent application data with `s2n_send`. This is a quirk of the
+TLS1.3 protocol message ordering: the server does not send any more handshake messages
+after the client sends the client certificate (see the [TLS1.3 state machine](https://www.rfc-editor.org/rfc/rfc8446.html#appendix-A.2)).
+There is no security risk, since the client has already authenticated the server,
+but it could make handshake failures and authentication errors more difficult to handle.
+
 ### Certificate Inspection
 
 Applications may want to know which certificate was used by a server for authentication during a connection, since servers can set multiple certificates. `s2n_connection_get_selected_cert()` will return the local certificate chain object used to authenticate. `s2n_connection_get_peer_cert_chain()` will provide the peer's certificate chain, if they sent one. Use `s2n_cert_chain_get_length()` and `s2n_cert_chain_get_cert()` to parse the certificate chain object and get a single certificate from the chain. Use `s2n_cert_get_der()` to get the DER encoded certificate if desired.
@@ -543,7 +552,7 @@ Online Certificate Status Protocol (OCSP) is a protocol to establish whether or 
 
 OCSP stapling can be applied to both client and server certificates when using TLS1.3, but only to server certificates when using TLS1.2.
 
-To use OCSP stapling, both server and client must call `s2n_config_set_status_request_type()` with S2N_STATUS_REQUEST_OCSP. The server (or client, if using client authentication) will also need to call `s2n_cert_chain_and_key_set_ocsp_data()` to set the raw bytes of the OCSP stapling data.
+To use OCSP stapling, the requester must call `s2n_config_set_status_request_type()` with S2N_STATUS_REQUEST_OCSP. The responder will need to call `s2n_cert_chain_and_key_set_ocsp_data()` to set the raw bytes of the OCSP stapling data.
 
 The OCSP stapling information will be automatically validated if the underlying libcrypto supports OCSP validation. `s2n_config_set_check_stapled_ocsp_response()` can be called with "0" to turn this off. Call `s2n_connection_get_ocsp_response()` to retrieve the received OCSP stapling information for manual verification.
 
@@ -625,13 +634,28 @@ In TLS1.3, connections that resume using a session ticket CAN issue new session 
 
 s2n-tls stores the received Client Hello and makes it available to the application. Call `s2n_connection_get_client_hello()` to get a pointer to the `s2n_client_hello` struct storing the Client Hello message. A NULL value will be returned if the connection has not yet received the Client Hello. The earliest point in the handshake when this struct is available is during the [Client Hello Callback](#client-hello-callback). The stored Client Hello message will not be available after calling `s2n_connection_free_handshake()`.
 
-Call `s2n_client_hello_get_raw_message()` to retrieve the complete Client Hello message with the random bytes on it zeroed out. Note that SSLv2 Client Hello messages are structured differently than other versions and thus their raw messages should be parsed accordingly (see [RFC5246](https://tools.ietf.org/html/rfc5246#appendix-E.2).) Call `s2n_connection_get_client_hello_version()` to retrieve the Client Hello version.
+Call `s2n_client_hello_get_raw_message()` to retrieve the complete Client Hello message with the random bytes on it zeroed out.
 
-`s2n_client_hello_get_cipher_suites()` will retrieve the list of cipher suites sent by the client.
+Call `s2n_client_hello_get_cipher_suites()` to retrieve the list of cipher suites sent by the client.
 
-`s2n_client_hello_get_session_id()` will get the session ID sent by the client in the ClientHello message. Note that this value may not be the session ID eventually associated with this particular connection since the session ID can change when the server sends the Server Hello. The official session ID can be retrieved with `s2n_connection_get_session_id()`after the handshake completes.
+Call `s2n_client_hello_get_session_id()` to retrieve the session ID sent by the client in the ClientHello message. Note that this value may not be the session ID eventually associated with this particular connection since the session ID can change when the server sends the Server Hello. The official session ID can be retrieved with `s2n_connection_get_session_id()`after the handshake completes.
 
 Call `s2n_client_hello_get_extensions()` to retrieve the entire list of extensions sent in the Client Hello. Calling `s2n_client_hello_get_extension_by_id()` allows you to interrogate the `s2n_client_hello` struct for a specific extension.
+
+### SSLv2
+s2n-tls will not negotiate SSLv2, but will accept SSLv2 ClientHellos advertising a
+higher protocol version like SSLv3 or TLS1.0. This was a backwards compatibility
+strategy used by some old clients when connecting to a server that might only support SSLv2.
+
+You can determine whether an SSLv2 ClientHello was received by checking the value
+of `s2n_connection_get_client_hello_version()`. If an SSLv2 ClientHello was
+received, then `s2n_connection_get_client_protocol_version()` will still report
+the real protocol version requested by the client.
+
+SSLv2 ClientHellos are formatted differently than ClientHellos in later versions.
+`s2n_client_hello_get_raw_message()` and `s2n_client_hello_get_cipher_suites()`
+will produce differently formatted data. See the documentation for those methods
+for details about proper SSLv2 ClientHello parsing.
 
 ### Client Hello Callback
 
@@ -800,7 +824,7 @@ fails synchronously, simply return S2N_FAILURE from the callback. If the offload
 fails asynchronously, s2n-tls does not provide a way to communicate that result. Instead,
 simply shutdown and cleanup the connection as you would for any other error.
 
-## TLS1.3 Pre-Shared Key Related Calls
+## TLS1.3 Pre-Shared Keys
 
 s2n-tls supports pre-shared keys (PSKs) as of TLS1.3. PSKs allow users to establish secrets outside of the handshake, skipping certificate exchange and authentication.
 
@@ -815,63 +839,25 @@ A PSK must not be shared between more than one server and one client. An entity 
 
 ### Configuring External Pre-Shared Keys
 
-Use the following APIs to configure external pre-shared keys.
+Both clients and servers will need to create and append a PSK to a connection in order to negotiate that PSK. Call `s2n_external_psk_new()` to allocate memory for a PSK object. Call `s2n_psk_set_identity()` to set a unique identifier for the PSK. Note that this identity will be transmitted over the network unencrypted, so do not include any confidential information in it. Call `s2n_psk_set_secret()` to set the secret value for a given PSK. Deriving a shared secret from a password or other low-entropy source is _not_ secure and is subject to dictionary attacks. See [this RFC](https://www.rfc-editor.org/rfc/rfc9257.html#name-recommendations-for-externa) for more guidelines on creating a secure PSK secret. Call `s2n_psk_set_hmac()` to change the hmac algorithm (defaults to **S2N_PSK_HMAC_SHA256**) for a given PSK. Note that the hmac algorithm may influence server cipher-suite selection.
 
-```c
-struct s2n_psk* s2n_external_psk_new();
-int s2n_psk_free(struct s2n_psk **psk);
-int s2n_psk_set_identity(struct s2n_psk *psk, const uint8_t *identity, uint16_t identity_size);
-int s2n_psk_set_secret(struct s2n_psk *psk, const uint8_t *secret, uint16_t secret_size);
-int s2n_psk_set_hmac(struct s2n_psk *psk, s2n_psk_hmac hmac);
-int s2n_connection_append_psk(struct s2n_connection *conn, struct s2n_psk *psk);
-int s2n_config_set_psk_mode(struct s2n_config *config, s2n_psk_mode mode);
-int s2n_connection_set_psk_mode(struct s2n_connection *conn, s2n_psk_mode mode);
-```
+Call `s2n_connection_append_psk()` to append the newly created PSK to the connection. Both the server and client should call this API to add PSKs to their connection. PSKs that are appended first will be preferred over PSKs appended last unless custom PSK selection logic is implemented. Use `s2n_psk_free()` to free the memory allocated for a PSK once you have associated it with a connection.
 
-**s2n_external_psk_new** creates a new external PSK object with **S2N_PSK_HMAC_SHA256** as the default PSK hmac algorithm. Use **s2n_psk_free** to free the memory allocated to the external PSK object.
-
-**s2n_psk_set_identity** sets the identity for a given PSK. The identity is a unique identifier for the pre-shared secret. This identity is transmitted over the network unencrypted and is a non-secret value, therefore do not include any confidential information.
-
-**s2n_psk_set_secret** sets the secret value for a given PSK. Deriving a shared secret from a password or other low-entropy source is not secure and is subject to dictionary attacks.
-
-**s2n_psk_set_hmac** sets the PSK hmac algorithm for a given PSK. The supported PSK hmac algorithms are listed in the **s2n_psk_hmac** enum. This API overrides the default PSK hmac algorithm value of **S2N_PSK_HMAC_SHA256** and may influence the server cipher suite selection.
-
-**s2n_connection_append_psk** appends the PSK to the connection. Both server and client should call this API to add PSKs to their connection. The order this API is called matters, as PSKs that are appended first will be more preferred than PSKs appended last. This API must be called prior to the server selecting a PSK for the connection.
-
-**s2n_config_set_psk_mode** configures s2n-tls to expect either session resumption PSKs or external PSKs. This API should be called prior to selecting a PSK.
-
-**s2n_connection_set_psk_mode** overrides the PSK mode set on the config for this connection.
+External PSKs and Session Resumption cannot both be used in TLS13. Therefore, users must pick which mode they are using by calling `s2n_config_set_psk_mode()` prior to the handshake. Additionally, `s2n_connection_set_psk_mode()` overrides the PSK mode set on the config for a particular connection.
 
 ### Selecting a Pre-Shared Key
 
-By default, the server chooses the first identity in its PSK list that also appears in the client's PSK list. If you would like to implement your own PSK selection logic, use the **s2n_psk_selection_callback** to select the PSK to be used for the connection, along with the following offered PSK APIs to process the client sent list of PSKs.
+By default, a server chooses the first identity in its PSK list that also appears in the client's PSK list. The `s2n_psk_selection_callback` is available if you would like to implement your own PSK selection logic. Currently, this callback is not asynchronous. Call `s2n_config_set_psk_selection_callback()` to associate your `s2n_psk_selection_callback` with a config.
 
-```c
-typedef int (*s2n_psk_selection_callback)(struct s2n_connection *conn, void *context,
-                                          struct s2n_offered_psk_list *psk_list);
-int s2n_config_set_psk_selection_callback(struct s2n_config *config, s2n_psk_selection_callback cb, void *context);
-struct s2n_offered_psk* s2n_offered_psk_new();
-int s2n_offered_psk_free(struct s2n_offered_psk **psk);
-bool s2n_offered_psk_list_has_next(struct s2n_offered_psk_list *psk_list);
-int s2n_offered_psk_list_next(struct s2n_offered_psk_list *psk_list, struct s2n_offered_psk *psk);
-int s2n_offered_psk_list_reread(struct s2n_offered_psk_list *psk_list);
-int s2n_offered_psk_get_identity(struct s2n_offered_psk *psk, uint8_t** identity, uint16_t *size);
-int s2n_offered_psk_list_choose_psk(struct s2n_offered_psk_list *psk_list, struct s2n_offered_psk *psk);
-```
+The `s2n_psk_selection_callback` will provide the list of PSK identities sent by the client in the **psk_list** input parameter. You will need to create an offered PSK object by calling `s2n_offered_psk_new()` and pass this object as a parameter in `s2n_offered_psk_list_next()` in order to populate the offered PSK object. Call `s2n_offered_psk_list_has_next()` prior to calling `s2n_offered_psk_list_next()` to determine if there exists another PSK in the **psk_list**. Call `s2n_offered_psk_get_identity()` to get the identity of a particular **s2n_offered_psk**.
 
-**s2n_psk_selection_callback** is a callback function that the server calls to select a PSK from a list of offered PSKs. Implement this callback to use custom PSK selection logic. To examine the list of client PSK identities use the input **psk_list** along with the **s2n_offered_psk_list_next** and **s2n_offered_psk_get_identity** APIs. To choose a client PSK identity, call **s2n_offered_psk_list_choose_psk**. Before a client PSK identity is chosen, the server must have configured its corresponding PSK using **s2n_connection_append_psk**. Currently, this callback is not asynchronous.
+Call `s2n_offered_psk_list_choose_psk()` to choose a particular **s2n_offered_psk** to be used for the connection. Note that the server must have already configured the corresponding PSK on the connection using `s2n_connection_append_psk()`. To disable PSKs for the connection and perform a full handshake instead, set the PSK identity to NULL. Call `s2n_offered_psk_free()` once you have chosen a particular PSK to free the memory allocated.
 
-**s2n_config_set_psk_selection_callback** sets the **s2n_psk_selection_callback**. If it is not set, the s2n-tls server chooses the first identity in its PSK list that also appears in the client's PSK list.
+If desired, `s2n_offered_psk_list_reread()` returns the offered PSK list to its original read state. After `s2n_offered_psk_list_reread()` is called, the next call to `s2n_offered_psk_list_next()` will return the first PSK in the offered PSK list.
 
-**s2n_offered_psk_new** creates a new offered PSK object. Pass this object to **s2n_offered_psk_list_next** to retrieve the next PSK from the list.  Use **s2n_offered_psk_list_has_next** prior to this API call to ensure we have not reached the end of the list. **s2n_offered_psk_free** frees the memory associated with the **s2n_offered_psk** object.
+Use `s2n_connection_get_negotiated_psk_identity()` to retrieve the PSK identity selected by the server for the connection.
 
-**s2n_offered_psk_list_reread** returns the offered PSK list to its original read state. After **s2n_offered_psk_list_reread** is called, the next call to **s2n_offered_psk_list_next** will return the first PSK in the offered PSK list.
-
-**s2n_offered_psk_get_identity** gets the identity and identity length for a given offered PSK object.
-
-**s2n_offered_psk_list_choose_psk** sets the chosen offered PSK to be used for the connection. To disable PSKs for the connection and perform a full handshake instead, set the PSK identity to NULL.
-
-In the following example, **s2n_psk_selection_callback** chooses the first client offered PSK identity present in an external store.
+In the following example, `s2n_psk_selection_callback` chooses the first client offered PSK identity present in an external store.
 
 ```c
 int s2n_psk_selection_callback(struct s2n_connection *conn, void *context,
@@ -897,17 +883,6 @@ int s2n_psk_selection_callback(struct s2n_connection *conn, void *context,
     return S2N_SUCCESS;
 }
 ```
-
-### Retrieve the Negotiated Pre-Shared Key
-
-The following APIs enable the caller to retrieve the PSK selected by the server for the connection.
-
-```c
-int s2n_connection_get_negotiated_psk_identity_length(struct s2n_connection *conn, uint16_t *identity_length);
-int s2n_connection_get_negotiated_psk_identity(struct s2n_connection *conn, uint8_t *identity, uint16_t max_identity_length);
-```
-
-**s2n_connection_get_negotiated_psk_identity** gets the identity of the PSK used to negotiate the connection. **s2n_connection_get_negotiated_psk_identity_length** gets the length of the identity. If the connection performed a full handshake instead of using PSKs then **s2n_connection_get_negotiated_psk_identity_length** returns 0 and **s2n_connection_get_negotiated_psk_identity** does nothing.
 
 ## I/O functions
 

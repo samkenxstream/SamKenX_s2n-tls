@@ -69,8 +69,14 @@ static S2N_RESULT s2n_generate_client_session_id(struct s2n_connection *conn)
         return S2N_RESULT_OK;
     }
 
-    /* Only generate the session id for TLS1.3 if in middlebox compatibility mode */
-    if (conn->client_protocol_version >= S2N_TLS13 && !s2n_is_middlebox_compat_enabled(conn)) {
+    /* Only generate the session id for TLS1.3 if in middlebox compatibility mode
+     *
+     * s2n_connection_get_protocol_version, which returns conn->actual_protocol_version, is used here because
+     * s2n_tls12_client_deserialize_session_state sets actual_protocol_version based on the protocol the 
+     * server that issued the session ticket indicated. If we are attempting to resume a session for that
+     * session ticket, we should base the decision of whether to generate a session ID on the protocol version
+     * we are attempting to resume with. */
+    if (s2n_connection_get_protocol_version(conn) >= S2N_TLS13 && !s2n_is_middlebox_compat_enabled(conn)) {
         return S2N_RESULT_OK;
     }
 
@@ -499,31 +505,24 @@ fail:
     RESULT_BAIL(S2N_ERR_CANCELLED);
 }
 
-bool s2n_client_hello_invoke_callback(struct s2n_connection *conn)
-{
-    /* Invoke only if the callback has not been called or if polling mode is enabled */
-    bool invoke = !conn->client_hello.callback_invoked || conn->config->client_hello_cb_enable_poll;
-    /*
-     * The callback should not be called if this client_hello is in response to a hello retry.
-     */
-    return invoke && !IS_HELLO_RETRY_HANDSHAKE(conn);
-}
-
 int s2n_client_hello_recv(struct s2n_connection *conn)
 {
-    if (conn->config->client_hello_cb_enable_poll == 0) {
-        POSIX_ENSURE(conn->client_hello.callback_async_blocked == 0, S2N_ERR_ASYNC_BLOCKED);
+    POSIX_ENSURE(!conn->client_hello.callback_async_blocked, S2N_ERR_ASYNC_BLOCKED);
+
+    /* Only parse the ClientHello once */
+    if (!conn->client_hello.parsed) {
+        POSIX_GUARD(s2n_parse_client_hello(conn));
+        conn->client_hello.parsed = true;
     }
 
-    if (conn->client_hello.parsed == 0) {
-        /* Parse client hello */
-        POSIX_GUARD(s2n_parse_client_hello(conn));
-        conn->client_hello.parsed = 1;
-    }
-    /* Call the client_hello_cb once unless polling is enabled. */
-    if (s2n_client_hello_invoke_callback(conn)) {
+    /* Only invoke the ClientHello callback once.
+     * This means that we do NOT invoke the callback again on the second ClientHello
+     * in a TLS1.3 retry handshake. We explicitly check for a retry because the
+     * callback state may have been cleared while parsing the second ClientHello.
+     */
+    if (!conn->client_hello.callback_invoked && !IS_HELLO_RETRY_HANDSHAKE(conn)) {
         /* Mark the collected client hello as available when parsing is done and before the client hello callback */
-        conn->client_hello.callback_invoked = 1;
+        conn->client_hello.callback_invoked = true;
 
         /* Call client_hello_cb if exists, letting application to modify s2n_connection or swap s2n_config */
         if (conn->config->client_hello_cb) {
@@ -652,10 +651,24 @@ int s2n_client_hello_send(struct s2n_connection *conn)
     return S2N_SUCCESS;
 }
 
-/* See http://www-archive.mozilla.org/projects/security/pki/nss/ssl/draft02.html 2.5 */
+/*
+ * s2n-tls does NOT support SSLv2. However, it does support SSLv2 ClientHellos.
+ * Clients may send SSLv2 ClientHellos advertising higher protocol versions for
+ * backwards compatibility reasons. See https://tools.ietf.org/rfc/rfc2246 Appendix E.
+ *
+ * In this case, conn->client_hello_version will be SSLv2, but conn->client_protocol_version
+ * will likely be higher.
+ *
+ * See http://www-archive.mozilla.org/projects/security/pki/nss/ssl/draft02.html Section 2.5
+ * for a description of the expected SSLv2 format.
+ * Alternatively, the TLS1.0 RFC includes a more modern description of the format:
+ * https://tools.ietf.org/rfc/rfc2246 Appendix E.1
+ */
 int s2n_sslv2_client_hello_recv(struct s2n_connection *conn)
 {
     struct s2n_client_hello *client_hello = &conn->client_hello;
+    client_hello->sslv2 = true;
+
     struct s2n_stuffer in_stuffer = { 0 };
     POSIX_GUARD(s2n_stuffer_init(&in_stuffer, &client_hello->raw_message));
     POSIX_GUARD(s2n_stuffer_skip_write(&in_stuffer, client_hello->raw_message.size));
@@ -713,7 +726,7 @@ int s2n_sslv2_client_hello_recv(struct s2n_connection *conn)
     return 0;
 }
 
-static int s2n_client_hello_get_parsed_extension(s2n_tls_extension_type extension_type,
+int s2n_client_hello_get_parsed_extension(s2n_tls_extension_type extension_type,
         s2n_parsed_extensions_list *parsed_extension_list, s2n_parsed_extension **parsed_extension)
 {
     POSIX_ENSURE_REF(parsed_extension_list);

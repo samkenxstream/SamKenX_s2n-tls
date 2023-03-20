@@ -13,9 +13,8 @@
 * permissions and limitations under the License.
 */
 
-#include <openssl/evp.h>
+#pragma once
 
-int main() {
-    EVP_PKEY_CTX *kyber_pkey_ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_KYBER512, NULL);
-   return 0;
-}
+#include "tls/extensions/s2n_extension_type.h"
+
+extern const s2n_extension_type s2n_server_cert_status_request_extension;

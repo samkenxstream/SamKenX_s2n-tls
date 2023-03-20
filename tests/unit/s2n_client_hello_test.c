@@ -284,6 +284,23 @@ int main(int argc, char **argv)
                 EXPECT_SUCCESS(s2n_config_free(config));
             };
 
+            /* Generate a session id if the negotiated protocol is less than TLS1.3 */
+            {
+                DEFER_CLEANUP(struct s2n_connection *conn = s2n_connection_new(S2N_CLIENT),
+                        s2n_connection_ptr_free);
+                EXPECT_NOT_NULL(conn);
+                struct s2n_stuffer *hello_stuffer = &conn->handshake.io;
+                conn->actual_protocol_version = S2N_TLS12;
+                EXPECT_TRUE(conn->client_protocol_version >= S2N_TLS13);
+
+                EXPECT_SUCCESS(s2n_client_hello_send(conn));
+                EXPECT_SUCCESS(s2n_stuffer_skip_read(hello_stuffer, LENGTH_TO_SESSION_ID));
+
+                uint8_t session_id_length = 0;
+                EXPECT_SUCCESS(s2n_stuffer_read_uint8(hello_stuffer, &session_id_length));
+                EXPECT_EQUAL(session_id_length, S2N_TLS_SESSION_ID_MAX_LEN);
+            }
+
             EXPECT_SUCCESS(s2n_disable_tls13_in_test());
         }
 
@@ -687,16 +704,22 @@ int main(int argc, char **argv)
         EXPECT_SUCCESS(s2n_io_pair_init_non_blocking(&io_pair));
 
         EXPECT_NOT_NULL(server_conn = s2n_connection_new(S2N_SERVER));
-        server_conn->actual_protocol_version = S2N_TLS12;
-        server_conn->server_protocol_version = S2N_TLS12;
-        server_conn->client_protocol_version = S2N_TLS12;
         EXPECT_SUCCESS(s2n_connection_set_io_pair(server_conn, &io_pair));
 
         EXPECT_NOT_NULL(server_config = s2n_config_new());
         EXPECT_SUCCESS(s2n_config_add_cert_chain_and_key_to_store(server_config, chain_and_key));
-        /* Security policy must support SSLv2 */
-        EXPECT_SUCCESS(s2n_config_set_cipher_preferences(server_config, "test_all"));
         EXPECT_SUCCESS(s2n_connection_set_config(server_conn, server_config));
+
+        /* The security policy does not need to support SSLv2.
+         *
+         * s2n-tls does NOT support SSLv2. However, it does accept ClientHellos in the SSLv2
+         * format but advertising higher protocol versions. Clients use this strategy to
+         * communicate with servers in a backwards-compatible way.
+         *
+         * Our test SSLv2 ClientHello advertises TLS1.2.
+         * So the security policy only needs to support TLS1.2.
+         */
+        EXPECT_SUCCESS(s2n_config_set_cipher_preferences(server_config, "default"));
 
         /* Send the client hello message */
         EXPECT_EQUAL(write(io_pair.client, sslv2_client_hello_header, sslv2_client_hello_header_len), sslv2_client_hello_header_len);
@@ -714,6 +737,9 @@ int main(int argc, char **argv)
 
         uint8_t *collected_client_hello = client_hello->raw_message.data;
         uint16_t collected_client_hello_len = client_hello->raw_message.size;
+
+        /* Verify correctly identified as SSLv2 */
+        EXPECT_TRUE(client_hello->sslv2);
 
         /* Verify collected client hello message length */
         EXPECT_EQUAL(collected_client_hello_len, sslv2_client_hello_len);
@@ -821,7 +847,7 @@ int main(int argc, char **argv)
         };
         int server_name_extension_len = sizeof(server_name_extension);
 
-        int client_extensions_len = sizeof(client_extensions);
+        size_t client_extensions_len = sizeof(client_extensions);
         uint8_t client_hello_prefix[] = {
             /* Protocol version TLS 1.2 */
             0x03,
@@ -910,6 +936,9 @@ int main(int argc, char **argv)
         EXPECT_EQUAL(server_conn->handshake.handshake_type, NEGOTIATED | FULL_HANDSHAKE);
 
         struct s2n_client_hello *client_hello = s2n_connection_get_client_hello(server_conn);
+
+        /* Verify correctly identified as NOT sslv2 */
+        EXPECT_FALSE(client_hello->sslv2);
 
         /* Verify s2n_connection_get_client_hello returns the handle to the s2n_client_hello on the connection */
         EXPECT_EQUAL(client_hello, &server_conn->client_hello);
@@ -1356,8 +1385,8 @@ int main(int argc, char **argv)
         EXPECT_NOT_NULL(server_conn);
 
         /* Handshake is hello retry and TLS1.3 was negotiated */
-        EXPECT_OK(s2n_handshake_type_set_flag(server_conn, HELLO_RETRY_REQUEST));
         server_conn->actual_protocol_version = S2N_TLS13;
+        EXPECT_OK(s2n_handshake_type_set_tls13_flag(server_conn, HELLO_RETRY_REQUEST));
 
         /* Second client hello has version SSLv2 */
         server_conn->client_hello_version = S2N_SSLv2;

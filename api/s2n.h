@@ -997,7 +997,7 @@ S2N_API extern int s2n_config_set_protocol_preferences(struct s2n_config *config
 
 /**
  * Enum used to define the type, if any, of certificate status request
- * an S2N_CLIENT should make during the handshake. The only supported status request type is
+ * a connection should make during the handshake. The only supported status request type is
  * OCSP, `S2N_STATUS_REQUEST_OCSP`.
 */
 typedef enum {
@@ -1006,7 +1006,7 @@ typedef enum {
 } s2n_status_request_type;
 
 /**
- * Sets up an S2N_CLIENT to request the server certificate status during an SSL handshake. If set
+ * Sets up a connection to request the certificate status of a peer during an SSL handshake. If set
  * to S2N_STATUS_REQUEST_NONE, no status request is made.
  *
  * @param config The configuration object being updated
@@ -1325,12 +1325,16 @@ S2N_API extern ssize_t s2n_client_hello_get_raw_message_length(struct s2n_client
 /**
  * Copies `max_length` bytes of the ClientHello message into the `out` buffer.
  * The ClientHello instrumented using this function will have the Random bytes
- * zero-ed out. For SSLv2 ClientHello messages, the raw message contains only
- * the cipher_specs, session_id and members portions of the hello message
- * (see [RFC5246](https://tools.ietf.org/html/rfc5246#appendix-E.2)). To access other
- * members, you may use s2n_connection_get_client_hello_version(),
- * s2n_connection_get_client_protocol_version() and s2n_connection_get_session_id_length()
- * accessors functions.
+ * zero-ed out.
+ *
+ * Note: SSLv2 ClientHello messages follow a different structure than more modern
+ * ClientHello messages. See [RFC5246](https://tools.ietf.org/html/rfc5246#appendix-E.2).
+ * In addition, due to how s2n-tls parses SSLv2 ClientHellos, the raw message is
+ * missing the first three bytes (the msg_type and version) and instead begins with
+ * the cipher_specs. To determine whether a ClientHello is an SSLv2 ClientHello,
+ * you will need to use s2n_connection_get_client_hello_version(). To get the
+ * protocol version advertised in the SSLv2 ClientHello (which may be higher
+ * than SSLv2), you will need to use s2n_connection_get_client_protocol_version().
  *
  * @param ch The Client Hello handle
  * @param out The destination buffer for the raw Client Hello
@@ -1350,6 +1354,11 @@ S2N_API extern ssize_t s2n_client_hello_get_cipher_suites_length(struct s2n_clie
 
 /**
  * Copies into the `out` buffer `max_length` bytes of the cipher_suites on the ClientHello.
+ *
+ * Note: SSLv2 ClientHello cipher suites follow a different structure than modern
+ * ClientHello messages. See [RFC5246](https://tools.ietf.org/html/rfc5246#appendix-E.2).
+ * To determine whether a ClientHello is an SSLv2 ClientHello,
+ * you will need to use s2n_connection_get_client_hello_version().
  *
  * @param ch The Client Hello handle
  * @param out The destination buffer for the raw Client Hello cipher suites
@@ -1766,6 +1775,11 @@ typedef enum {
 
 /**
  * Performs the initial "handshake" phase of a TLS connection and must be called before any s2n_recv() or s2n_send() calls.
+ *
+ * @note When using client authentication with TLS1.3, s2n_negotiate() will report a successful
+ * handshake to clients before the server validates the client certificate. If the server then
+ * rejects the client certificate, the client may later receive an alert while calling s2n_recv,
+ * potentially after already having sent application data with s2n_send.
  *
  * @param conn A pointer to the s2n_connection object
  * @param blocked A pointer which will be set to the blocked status. 
@@ -2199,7 +2213,7 @@ S2N_API extern int s2n_connection_get_session_id(struct s2n_connection *conn, ui
 S2N_API extern int s2n_connection_is_session_resumed(struct s2n_connection *conn);
 
 /**
- * Check is the connection is OCSP stapled.
+ * Check if the connection is OCSP stapled.
  *
  * @param conn A pointer to the s2n_connection object
  *
